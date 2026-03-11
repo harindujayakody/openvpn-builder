@@ -13,13 +13,13 @@ ZIP_DIR="${STATE_DIR}/zips"
 
 mkdir -p "$INSTALL_DIR" "$STATE_DIR" "$CLIENT_DIR" "$ZIP_DIR"
 
-# ── Dependencies ────────────────────────────────────────────────────────────
+# ── Dependencies ─────────────────────────────────────────────────────────────
 apt-get update -y
 apt-get install -y \
   openvpn easy-rsa curl openssl ufw zip unzip \
-  iptables iproute2 ca-certificates
+  iptables iproute2 ca-certificates python3 resolvconf
 
-# ── EasyRSA PKI bootstrap (only if not already done) ────────────────────────
+# ── EasyRSA PKI bootstrap (only once) ────────────────────────────────────────
 if [[ ! -f "${EASYRSA_DIR}/pki/ca.crt" ]]; then
   echo "[INFO] Bootstrapping PKI with EasyRSA..."
   make-cadir "$EASYRSA_DIR"
@@ -51,8 +51,11 @@ VARS_EOF
   echo "[OK]  PKI ready"
 fi
 
-# ── OpenVPN server config ────────────────────────────────────────────────────
+# ── Detect external interface ─────────────────────────────────────────────────
 EXT_IF="$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1)"
+
+# ── OpenVPN server config — DNS-leak hardened ─────────────────────────────────
+mkdir -p /var/log/openvpn
 
 cat > /etc/openvpn/server/server.conf <<SCONF
 port 1194
@@ -68,50 +71,83 @@ tls-auth ${EASYRSA_DIR}/pki/ta.key 0
 server 10.8.0.0 255.255.255.0
 ifconfig-pool-persist /var/log/openvpn/ipp.txt
 
+# Force ALL traffic through VPN tunnel
 push "redirect-gateway def1 bypass-dhcp"
-push "dhcp-option DNS 8.8.8.8"
-push "dhcp-option DNS 8.8.4.4"
+
+# DNS: Cloudflare — fast, no filtering, Facebook-friendly
+push "dhcp-option DNS 1.1.1.1"
+push "dhcp-option DNS 1.0.0.1"
+
+# Block client from using any DNS outside the tunnel
+push "block-outside-dns"
+
+# Route all Facebook IP ranges through tunnel
+push "route 157.240.0.0 255.255.0.0"
+push "route 31.13.24.0 255.255.248.0"
+push "route 31.13.64.0 255.255.192.0"
+push "route 66.220.144.0 255.255.240.0"
+push "route 69.63.176.0 255.255.240.0"
+push "route 69.171.224.0 255.255.224.0"
+push "route 74.119.76.0 255.255.252.0"
+push "route 103.4.96.0 255.255.252.0"
+push "route 129.134.0.0 255.255.0.0"
+push "route 163.70.128.0 255.255.128.0"
+push "route 185.89.216.0 255.255.252.0"
+push "route 204.15.20.0 255.255.252.0"
+
+# IPv6 tunnel to prevent IPv6 leak (Facebook resolves to IPv6)
+push "tun-ipv6"
+push "route-ipv6 2000::/3"
+push "ifconfig-ipv6 fd42:42:42::1/112 fd42:42:42::2"
 
 keepalive 10 120
-cipher AES-256-CBC
+
+# Strong encryption
+cipher AES-256-GCM
 auth SHA256
-comp-lzo
+tls-version-min 1.2
+tls-cipher TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384
+ncp-ciphers AES-256-GCM:AES-256-CBC
+
+comp-lzo no
 user nobody
 group nogroup
 persist-key
 persist-tun
 
-status /var/log/openvpn/openvpn-status.log
-log    /var/log/openvpn/openvpn.log
+status  /var/log/openvpn/openvpn-status.log
+log     /var/log/openvpn/openvpn.log
 verb 3
 SCONF
 
-mkdir -p /var/log/openvpn
-
-# ── IP forwarding & NAT ──────────────────────────────────────────────────────
+# ── IP forwarding ─────────────────────────────────────────────────────────────
 echo 1 > /proc/sys/net/ipv4/ip_forward
-sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf || \
+grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null || \
   echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 sysctl -p >/dev/null 2>&1 || true
 
+# ── NAT masquerade ────────────────────────────────────────────────────────────
 iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o "$EXT_IF" -j MASQUERADE 2>/dev/null || \
   iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$EXT_IF" -j MASQUERADE
 
-# persist iptables rule
+# Block DNS leaking outside the tunnel (port 53 UDP+TCP)
+iptables -I FORWARD -i tun0 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -i tun0 -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+
 if command -v iptables-save &>/dev/null; then
   mkdir -p /etc/iptables
   iptables-save > /etc/iptables/rules.v4 || true
 fi
 
-# ── UFW ─────────────────────────────────────────────────────────────────────
+# ── UFW ───────────────────────────────────────────────────────────────────────
 ufw allow 1194/udp >/dev/null 2>&1 || true
 ufw allow OpenSSH  >/dev/null 2>&1 || true
 
-# ── Enable & start OpenVPN ───────────────────────────────────────────────────
+# ── Start OpenVPN ─────────────────────────────────────────────────────────────
 systemctl enable openvpn-server@server >/dev/null 2>&1 || true
 systemctl restart openvpn-server@server || true
 
-# ── Write the manager script ─────────────────────────────────────────────────
+# ── Manager script ────────────────────────────────────────────────────────────
 cat > "$MANAGER_PATH" <<'MANAGER_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -122,7 +158,7 @@ CLIENT_DIR="${STATE_DIR}/clients"
 ZIP_DIR="${STATE_DIR}/zips"
 DB_FILE="${STATE_DIR}/clients.db"
 PROJECT_NAME="OpenVPN Builder"
-PROJECT_REPO="https://github.com/harindujayakody/proxy-builder"
+PROJECT_REPO="https://github.com/harindujayakody/openvpn-builder"
 PROJECT_AUTHOR="Harindu Jayakody"
 
 mkdir -p "$CLIENT_DIR" "$ZIP_DIR"
@@ -145,7 +181,12 @@ require_root() {
   fi
 }
 
-line() { printf '%*s\n' "${COLUMNS:-70}" '' | tr ' ' '─'; }
+line()  { printf '%*s\n' "${COLUMNS:-70}" '' | tr ' ' '─'; }
+ok()    { echo -e "${GREEN}[OK]${RESET}   $*"; }
+info()  { echo -e "${BLUE}[INFO]${RESET} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+fail()  { echo -e "${RED}[ERR]${RESET}  $*"; }
+pause() { echo; read -rp "Press Enter to continue..." _; }
 
 title() {
   clear
@@ -159,13 +200,6 @@ title() {
   echo
 }
 
-ok()   { echo -e "${GREEN}[OK]${RESET}   $*"; }
-info() { echo -e "${BLUE}[INFO]${RESET} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
-fail() { echo -e "${RED}[ERR]${RESET}  $*"; }
-
-pause() { echo; read -rp "Press Enter to continue..." _; }
-
 get_public_ip() {
   local ip
   ip="$(curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || true)"
@@ -176,8 +210,7 @@ get_public_ip() {
 count_clients() { grep -c . "$DB_FILE" 2>/dev/null || true; }
 
 client_exists() {
-  local name="$1"
-  grep -q "^${name}:" "$DB_FILE" 2>/dev/null || false
+  grep -q "^${1}:" "$DB_FILE" 2>/dev/null || false
 }
 
 random_name() {
@@ -188,18 +221,17 @@ pick_unique_name() {
   local n
   while true; do
     n="$(random_name)"
-    if ! client_exists "$n"; then echo "$n"; return; fi
+    client_exists "$n" || { echo "$n"; return; }
   done
 }
 
-# ── Generate a single .ovpn file ─────────────────────────────────────────────
+# ── Generate one signed .ovpn ─────────────────────────────────────────────────
 generate_ovpn() {
-  local name="$1"
-  local pub_ip="$2"
+  local name="$1" pub_ip="$2"
   local ovpn_path="${CLIENT_DIR}/${name}.ovpn"
 
   cd "$EASYRSA_DIR"
-  ./easyrsa --batch gen-req "$name" nopass 2>/dev/null
+  ./easyrsa --batch gen-req  "$name" nopass 2>/dev/null
   ./easyrsa --batch sign-req client "$name" 2>/dev/null
   cd - >/dev/null
 
@@ -219,9 +251,27 @@ nobind
 persist-key
 persist-tun
 remote-cert-tls server
-cipher AES-256-CBC
+
+# Strong encryption
+cipher AES-256-GCM
 auth SHA256
-comp-lzo
+tls-version-min 1.2
+tls-cipher TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384
+
+# DNS leak prevention — force Cloudflare DNS inside tunnel
+block-outside-dns
+dhcp-option DNS 1.1.1.1
+dhcp-option DNS 1.0.0.1
+
+# Force all traffic through VPN
+redirect-gateway def1 bypass-dhcp
+
+# Prevent IPv6 leaks
+tun-ipv6
+pull-filter ignore "route-ipv6"
+pull-filter ignore "ifconfig-ipv6"
+
+comp-lzo no
 verb 3
 key-direction 1
 
@@ -242,22 +292,60 @@ OVPN
   echo "$ovpn_path"
 }
 
+# ── Auto serve ZIP — temporary download link, no prompts ─────────────────────
+serve_zip() {
+  local zip_path="$1"
+  local pub_ip port filename
+  pub_ip="$(get_public_ip)"
+  port="$(shuf -i 8100-8900 -n 1)"
+  filename="$(basename "$zip_path")"
+
+  ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+
+  echo
+  echo -e "${CYAN}${BOLD}  ╔════════════════════════════════════════════════════════════╗${RESET}"
+  echo -e "${CYAN}${BOLD}  ║              📦  YOUR DOWNLOAD LINK                       ║${RESET}"
+  echo -e "${CYAN}${BOLD}  ╚════════════════════════════════════════════════════════════╝${RESET}"
+  echo
+  echo -e "  ${GREEN}${BOLD}  ➜  http://${pub_ip}:${port}/${filename}${RESET}"
+  echo
+  echo -e "  ${DIM}curl -O http://${pub_ip}:${port}/${filename}${RESET}"
+  echo
+  echo -e "  ${YELLOW}  Link is active for 90 seconds, then closes automatically.${RESET}"
+  echo
+
+  # Background server — kills itself after 90s
+  (
+    cd "$(dirname "$zip_path")"
+    timeout 90 python3 -m http.server "$port" --bind 0.0.0.0 >/dev/null 2>&1 || true
+    ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+  ) &
+
+  # Live countdown
+  local i
+  for ((i=90; i>0; i--)); do
+    printf "\r  ${DIM}⏱  Closing in %3d seconds...${RESET}   " "$i"
+    sleep 1
+  done
+  echo
+  echo
+  ok "Link expired. ZIP saved permanently at:"
+  echo -e "  ${DIM}${zip_path}${RESET}"
+}
+
 # ── Create single client ──────────────────────────────────────────────────────
 create_one() {
   local pub_ip name ovpn_path zip_path
   pub_ip="$(get_public_ip)"
   [[ -z "$pub_ip" ]] && { fail "No public IPv4 detected."; return; }
 
-  read -rp "Client name (leave blank for random): " name
+  read -rp "Client name (blank = random): " name
   name="${name:-$(pick_unique_name)}"
-
-  # sanitize
   name="$(echo "$name" | tr -dc 'a-zA-Z0-9_-' | head -c 32)"
   [[ -z "$name" ]] && { fail "Invalid name."; return; }
 
   if client_exists "$name"; then
-    fail "Client '${name}' already exists."
-    return
+    fail "Client '${name}' already exists."; return
   fi
 
   info "Generating certificate for '${name}'..."
@@ -265,104 +353,62 @@ create_one() {
 
   zip_path="${ZIP_DIR}/${name}.zip"
   zip -j "$zip_path" "$ovpn_path" >/dev/null
-
   echo "${name}:${pub_ip}:$(date +%Y-%m-%d)" >> "$DB_FILE"
 
-  ok "Client created: ${name}"
-  echo
-  echo -e "${BOLD}  .ovpn file :${RESET} ${ovpn_path}"
-  echo -e "${BOLD}  .zip file  :${RESET} ${zip_path}"
-  echo
-  echo -e "${DIM}  Download:  cat ${zip_path} | base64${RESET}"
+  ok "Client '${name}' created"
+  serve_zip "$zip_path"
 }
 
-# ── Bulk create clients ───────────────────────────────────────────────────────
+# ── Bulk create ───────────────────────────────────────────────────────────────
 create_bulk() {
   local pub_ip count prefix
   pub_ip="$(get_public_ip)"
   [[ -z "$pub_ip" ]] && { fail "No public IPv4 detected."; return; }
 
-  read -rp "How many clients to create (1-200): " count
+  read -rp "How many clients (1-200): " count
   if ! [[ "$count" =~ ^[0-9]+$ ]] || (( count < 1 || count > 200 )); then
-    fail "Count must be between 1 and 200."
-    return
+    fail "Count must be 1–200."; return
   fi
 
-  read -rp "Name prefix (leave blank for 'client'): " prefix
+  read -rp "Name prefix (blank = 'client'): " prefix
   prefix="${prefix:-client}"
   prefix="$(echo "$prefix" | tr -dc 'a-zA-Z0-9_-' | head -c 20)"
   [[ -z "$prefix" ]] && prefix="client"
 
-  local names=()
-  local i=1
+  # Build unique name list
+  local names=() i=1
   while (( ${#names[@]} < count )); do
     local candidate="${prefix}_$(printf '%03d' $i)"
-    if ! client_exists "$candidate"; then
-      names+=("$candidate")
-    fi
+    client_exists "$candidate" || names+=("$candidate")
     ((i++))
   done
 
-  echo
-  info "Creating ${count} OpenVPN clients with prefix '${prefix}'..."
-  echo
-
-  local all_zip="${ZIP_DIR}/bulk_${prefix}_$(date +%Y%m%d_%H%M%S).zip"
+  local timestamp
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  local all_zip="${ZIP_DIR}/bulk_${prefix}_${timestamp}.zip"
   local ovpn_files=()
 
+  echo
+  info "Generating ${count} clients — prefix '${prefix}'..."
+  echo
+
   for name in "${names[@]}"; do
-    info "  → ${name}"
+    printf "  ${BLUE}→${RESET} %-32s" "$name"
     local ovpn_path
     ovpn_path="$(generate_ovpn "$name" "$pub_ip")"
     ovpn_files+=("$ovpn_path")
     echo "${name}:${pub_ip}:$(date +%Y-%m-%d)" >> "$DB_FILE"
+    echo -e " ${GREEN}✓${RESET}"
   done
 
-  # zip all ovpn files into one archive
+  # Pack all into one ZIP
   zip -j "$all_zip" "${ovpn_files[@]}" >/dev/null
 
   echo
-  ok "Created ${count} clients"
-  echo
-  echo -e "${BOLD}  Individual .ovpn files :${RESET} ${CLIENT_DIR}/"
-  echo -e "${BOLD}  Bulk ZIP archive       :${RESET} ${all_zip}"
-  echo
-  echo -e "${GREEN}${BOLD}  ↓ Download ZIP:${RESET}"
-  echo -e "  ${DIM}cat ${all_zip} | base64${RESET}"
-  echo
-  show_download_link "$all_zip"
-}
+  ok "All ${count} clients packed → $(basename "$all_zip")"
 
-# ── Show a simple HTTP download server for a zip ─────────────────────────────
-show_download_link() {
-  local zip_path="$1"
-  local pub_ip port
-  pub_ip="$(get_public_ip)"
-  port="$(shuf -i 8100-8900 -n 1)"
-
-  echo
-  echo -e "${CYAN}${BOLD}  ┌─ One-Time Download Server ─────────────────────────────┐${RESET}"
-  echo -e "${CYAN}${BOLD}  │${RESET}  Run this on your server to serve the ZIP for 60s:     ${CYAN}${BOLD}│${RESET}"
-  echo -e "${CYAN}${BOLD}  │${RESET}                                                        ${CYAN}${BOLD}│${RESET}"
-  echo -e "${CYAN}${BOLD}  │${RESET}  ${BOLD}cd $(dirname "$zip_path") && python3 -m http.server ${port}${RESET}  ${CYAN}${BOLD}│${RESET}"
-  echo -e "${CYAN}${BOLD}  │${RESET}                                                        ${CYAN}${BOLD}│${RESET}"
-  echo -e "${CYAN}${BOLD}  │${RESET}  Then download from your browser or curl:              ${CYAN}${BOLD}│${RESET}"
-  echo -e "${CYAN}${BOLD}  │${RESET}  ${GREEN}http://${pub_ip}:${port}/$(basename "$zip_path")${RESET}  ${CYAN}${BOLD}│${RESET}"
-  echo -e "${CYAN}${BOLD}  └────────────────────────────────────────────────────────┘${RESET}"
-  echo
-  read -rp "  Start download server now? (60 second timeout) [y/N]: " yn
-  if [[ "${yn,,}" == "y" ]]; then
-    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
-    echo
-    ok "Server starting on port ${port}. Press Ctrl+C to stop."
-    echo -e "  ${GREEN}Download: http://${pub_ip}:${port}/$(basename "$zip_path")${RESET}"
-    echo
-    cd "$(dirname "$zip_path")"
-    timeout 60 python3 -m http.server "$port" 2>/dev/null || true
-    ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
-    echo
-    ok "Download server stopped."
-  fi
+  # Auto serve — no questions asked
+  serve_zip "$all_zip"
 }
 
 # ── List clients ──────────────────────────────────────────────────────────────
@@ -372,32 +418,25 @@ list_clients() {
   echo
   echo -e "${MAGENTA}${BOLD}OpenVPN Clients${RESET}"
   line
-
-  if [[ "$total" -eq 0 ]]; then
-    warn "No clients created yet."; return
-  fi
-
+  if [[ "$total" -eq 0 ]]; then warn "No clients yet."; return; fi
   local i=1
   while IFS=: read -r name ip date; do
-    echo -e "  ${BOLD}${i})${RESET} ${GREEN}${name}${RESET}  ${DIM}(server: ${ip} | created: ${date})${RESET}"
-    echo -e "      .ovpn → ${CLIENT_DIR}/${name}.ovpn"
+    echo -e "  ${BOLD}${i})${RESET} ${GREEN}${name}${RESET}  ${DIM}${ip} | ${date}${RESET}"
     ((i++))
   done < "$DB_FILE"
-
   echo
-  ok "Total clients: ${total}"
+  ok "Total: ${total}"
 }
 
-# ── Download / zip a single client ───────────────────────────────────────────
-download_single() {
+# ── Re-download any client zip ────────────────────────────────────────────────
+download_existing() {
   local total
   total="$(count_clients)"
-
-  if [[ "$total" -eq 0 ]]; then warn "No clients created yet."; return; fi
+  if [[ "$total" -eq 0 ]]; then warn "No clients yet."; return; fi
 
   list_clients
   echo
-  read -rp "Enter client number to download (0 to cancel): " sel
+  read -rp "Enter client number (0 to cancel): " sel
   [[ "$sel" == "0" ]] && return
 
   if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > total )); then
@@ -406,23 +445,21 @@ download_single() {
 
   local name
   name="$(sed -n "${sel}p" "$DB_FILE" | cut -d: -f1)"
-  local ovpn_path="${CLIENT_DIR}/${name}.ovpn"
   local zip_path="${ZIP_DIR}/${name}.zip"
 
-  if [[ ! -f "$ovpn_path" ]]; then
-    fail ".ovpn file not found for ${name}."; return
+  if [[ ! -f "$zip_path" ]]; then
+    local ovpn_path="${CLIENT_DIR}/${name}.ovpn"
+    [[ ! -f "$ovpn_path" ]] && { fail ".ovpn not found for ${name}."; return; }
+    zip -j "$zip_path" "$ovpn_path" >/dev/null
   fi
 
-  zip -j "$zip_path" "$ovpn_path" >/dev/null
-  ok "ZIP ready: ${zip_path}"
-  show_download_link "$zip_path"
+  serve_zip "$zip_path"
 }
 
-# ── Revoke / delete client ────────────────────────────────────────────────────
+# ── Revoke client ─────────────────────────────────────────────────────────────
 revoke_client() {
   local total
   total="$(count_clients)"
-
   if [[ "$total" -eq 0 ]]; then warn "No clients to revoke."; return; fi
 
   list_clients
@@ -439,34 +476,29 @@ revoke_client() {
 
   cd "$EASYRSA_DIR"
   ./easyrsa --batch revoke "$name" 2>/dev/null || true
-  ./easyrsa --batch gen-crl 2>/dev/null || true
+  ./easyrsa --batch gen-crl          2>/dev/null || true
   cp pki/crl.pem /etc/openvpn/server/crl.pem 2>/dev/null || true
   cd - >/dev/null
 
   rm -f "${CLIENT_DIR}/${name}.ovpn" "${ZIP_DIR}/${name}.zip"
   sed -i "/^${name}:/d" "$DB_FILE"
 
-  # add crl-verify to server config if not already there
   grep -q "crl-verify" /etc/openvpn/server/server.conf || \
     echo "crl-verify /etc/openvpn/server/crl.pem" >> /etc/openvpn/server/server.conf
-
   systemctl restart openvpn-server@server || true
-
-  ok "Client '${name}' revoked and removed."
+  ok "Client '${name}' revoked."
 }
 
-# ── Show server status ────────────────────────────────────────────────────────
+# ── Server status ─────────────────────────────────────────────────────────────
 show_status() {
   echo
   echo -e "${CYAN}${BOLD}OpenVPN Server Status${RESET}"
   line
-  systemctl status openvpn-server@server --no-pager -l 2>/dev/null || \
-    systemctl status openvpn@server --no-pager -l 2>/dev/null || \
-    echo "Could not get service status."
+  systemctl status openvpn-server@server --no-pager -l 2>/dev/null || true
   echo
   if [[ -f /var/log/openvpn/openvpn-status.log ]]; then
     echo -e "${BOLD}Connected clients:${RESET}"
-    cat /var/log/openvpn/openvpn-status.log
+    grep "^CLIENT_LIST" /var/log/openvpn/openvpn-status.log 2>/dev/null || echo "  None connected"
   fi
 }
 
@@ -476,13 +508,13 @@ show_summary() {
   pub_ip="$(get_public_ip)"
   echo
   line
-  echo -e "${BOLD}Project        :${RESET} ${PROJECT_NAME}"
-  echo -e "${BOLD}Public IPv4    :${RESET} ${pub_ip:-N/A}"
-  echo -e "${BOLD}Total Clients  :${RESET} ${total}"
-  echo -e "${BOLD}Client configs :${RESET} ${CLIENT_DIR}/"
-  echo -e "${BOLD}ZIP archives   :${RESET} ${ZIP_DIR}/"
-  echo -e "${BOLD}Command        :${RESET} sudo openvpnbuilder"
-  echo -e "${BOLD}GitHub         :${RESET} ${PROJECT_REPO}"
+  echo -e "${BOLD}Project       :${RESET} ${PROJECT_NAME}"
+  echo -e "${BOLD}Public IPv4   :${RESET} ${pub_ip:-N/A}"
+  echo -e "${BOLD}Total Clients :${RESET} ${total}"
+  echo -e "${BOLD}Clients dir   :${RESET} ${CLIENT_DIR}/"
+  echo -e "${BOLD}ZIPs dir      :${RESET} ${ZIP_DIR}/"
+  echo -e "${BOLD}Command       :${RESET} sudo openvpnbuilder"
+  echo -e "${BOLD}GitHub        :${RESET} ${PROJECT_REPO}"
   line
   echo
 }
@@ -490,10 +522,10 @@ show_summary() {
 menu() {
   title
   show_summary
-  echo -e "${BOLD}1)${RESET} Create Single Client"
-  echo -e "${BOLD}2)${RESET} Create Bulk Clients  ${DIM}(generates ZIP download)${RESET}"
+  echo -e "${BOLD}1)${RESET} Create Single Client       ${DIM}(auto download link)${RESET}"
+  echo -e "${BOLD}2)${RESET} Create Bulk Clients        ${DIM}(auto ZIP + download link)${RESET}"
   echo -e "${BOLD}3)${RESET} List All Clients"
-  echo -e "${BOLD}4)${RESET} Download Client ZIP"
+  echo -e "${BOLD}4)${RESET} Re-Download a Client ZIP"
   echo -e "${BOLD}5)${RESET} Revoke / Delete Client"
   echo -e "${BOLD}6)${RESET} Server Status"
   echo -e "${BOLD}7)${RESET} Exit"
@@ -506,12 +538,12 @@ main() {
     menu
     read -rp "Select option [1-7]: " choice
     case "$choice" in
-      1) create_one;      pause ;;
-      2) create_bulk;     pause ;;
-      3) list_clients;    pause ;;
-      4) download_single; pause ;;
-      5) revoke_client;   pause ;;
-      6) show_status;     pause ;;
+      1) create_one;        pause ;;
+      2) create_bulk;       pause ;;
+      3) list_clients;      pause ;;
+      4) download_existing; pause ;;
+      5) revoke_client;     pause ;;
+      6) show_status;       pause ;;
       7) exit 0 ;;
       *) fail "Invalid option"; sleep 1 ;;
     esac
