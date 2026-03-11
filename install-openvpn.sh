@@ -71,17 +71,11 @@ tls-auth ${EASYRSA_DIR}/pki/ta.key 0
 server 10.8.0.0 255.255.255.0
 ifconfig-pool-persist /var/log/openvpn/ipp.txt
 
-# Force ALL traffic through VPN tunnel
 push "redirect-gateway def1 bypass-dhcp"
-
-# DNS: Cloudflare — fast, no filtering, Facebook-friendly
 push "dhcp-option DNS 1.1.1.1"
 push "dhcp-option DNS 1.0.0.1"
-
-# Block client from using any DNS outside the tunnel
 push "block-outside-dns"
 
-# Route all Facebook IP ranges through tunnel
 push "route 157.240.0.0 255.255.0.0"
 push "route 31.13.24.0 255.255.248.0"
 push "route 31.13.64.0 255.255.192.0"
@@ -95,14 +89,11 @@ push "route 163.70.128.0 255.255.128.0"
 push "route 185.89.216.0 255.255.252.0"
 push "route 204.15.20.0 255.255.252.0"
 
-# IPv6 tunnel to prevent IPv6 leak (Facebook resolves to IPv6)
 push "tun-ipv6"
 push "route-ipv6 2000::/3"
 push "ifconfig-ipv6 fd42:42:42::1/112 fd42:42:42::2"
 
 keepalive 10 120
-
-# Strong encryption
 cipher AES-256-GCM
 auth SHA256
 tls-version-min 1.2
@@ -120,17 +111,15 @@ log     /var/log/openvpn/openvpn.log
 verb 3
 SCONF
 
-# ── IP forwarding ─────────────────────────────────────────────────────────────
+# ── IP forwarding + NAT ───────────────────────────────────────────────────────
 echo 1 > /proc/sys/net/ipv4/ip_forward
 grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null || \
   echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 sysctl -p >/dev/null 2>&1 || true
 
-# ── NAT masquerade ────────────────────────────────────────────────────────────
 iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o "$EXT_IF" -j MASQUERADE 2>/dev/null || \
   iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$EXT_IF" -j MASQUERADE
 
-# Block DNS leaking outside the tunnel (port 53 UDP+TCP)
 iptables -I FORWARD -i tun0 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
 iptables -I FORWARD -i tun0 -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
 
@@ -139,11 +128,9 @@ if command -v iptables-save &>/dev/null; then
   iptables-save > /etc/iptables/rules.v4 || true
 fi
 
-# ── UFW ───────────────────────────────────────────────────────────────────────
 ufw allow 1194/udp >/dev/null 2>&1 || true
 ufw allow OpenSSH  >/dev/null 2>&1 || true
 
-# ── Start OpenVPN ─────────────────────────────────────────────────────────────
 systemctl enable openvpn-server@server >/dev/null 2>&1 || true
 systemctl restart openvpn-server@server || true
 
@@ -168,8 +155,8 @@ RED="\033[1;31m"
 GREEN="\033[1;32m"
 YELLOW="\033[1;33m"
 BLUE="\033[1;34m"
-MAGENTA="\033[1;35m"
 CYAN="\033[1;36m"
+MAGENTA="\033[1;35m"
 DIM="\033[2m"
 BOLD="\033[1m"
 RESET="\033[0m"
@@ -213,14 +200,10 @@ client_exists() {
   grep -q "^${1}:" "$DB_FILE" 2>/dev/null || false
 }
 
-random_name() {
-  echo "client_$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)"
-}
-
 pick_unique_name() {
   local n
   while true; do
-    n="$(random_name)"
+    n="client_$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)"
     client_exists "$n" || { echo "$n"; return; }
   done
 }
@@ -251,26 +234,17 @@ nobind
 persist-key
 persist-tun
 remote-cert-tls server
-
-# Strong encryption
 cipher AES-256-GCM
 auth SHA256
 tls-version-min 1.2
 tls-cipher TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384
-
-# DNS leak prevention — force Cloudflare DNS inside tunnel
 block-outside-dns
 dhcp-option DNS 1.1.1.1
 dhcp-option DNS 1.0.0.1
-
-# Force all traffic through VPN
 redirect-gateway def1 bypass-dhcp
-
-# Prevent IPv6 leaks
 tun-ipv6
 pull-filter ignore "route-ipv6"
 pull-filter ignore "ifconfig-ipv6"
-
 comp-lzo no
 verb 3
 key-direction 1
@@ -292,45 +266,61 @@ OVPN
   echo "$ovpn_path"
 }
 
-# ── Auto serve ZIP — temporary download link, no prompts ─────────────────────
-serve_zip() {
+# ── Print download box + run foreground countdown server ──────────────────────
+serve_zip_with_link() {
   local zip_path="$1"
-  local pub_ip port filename
+  local pub_ip filename port server_pid
   pub_ip="$(get_public_ip)"
-  port="$(shuf -i 8100-8900 -n 1)"
   filename="$(basename "$zip_path")"
+  port="$(shuf -i 8100-8900 -n 1)"
 
+  # open firewall
   ufw allow "${port}/tcp" >/dev/null 2>&1 || true
 
+  # start python server in background, capture PID
+  cd "$(dirname "$zip_path")"
+  python3 -m http.server "$port" --bind 0.0.0.0 >/dev/null 2>&1 &
+  server_pid=$!
+  cd - >/dev/null
+
+  # print the download box immediately after server starts
   echo
-  echo -e "${CYAN}${BOLD}  ╔════════════════════════════════════════════════════════════╗${RESET}"
-  echo -e "${CYAN}${BOLD}  ║              📦  YOUR DOWNLOAD LINK                       ║${RESET}"
-  echo -e "${CYAN}${BOLD}  ╚════════════════════════════════════════════════════════════╝${RESET}"
+  echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════════════╗${RESET}"
+  echo -e "${GREEN}${BOLD}  ║                  📦  DOWNLOAD YOUR ZIP                      ║${RESET}"
+  echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════════════════════════╝${RESET}"
   echo
-  echo -e "  ${GREEN}${BOLD}  ➜  http://${pub_ip}:${port}/${filename}${RESET}"
+  echo -e "  ${BOLD}File    :${RESET} ${filename}"
+  echo -e "  ${BOLD}Link    :${RESET} ${GREEN}${BOLD}http://${pub_ip}:${port}/${filename}${RESET}"
   echo
+  echo -e "  ${DIM}wget http://${pub_ip}:${port}/${filename}${RESET}"
   echo -e "  ${DIM}curl -O http://${pub_ip}:${port}/${filename}${RESET}"
   echo
-  echo -e "  ${YELLOW}  Link is active for 90 seconds, then closes automatically.${RESET}"
+  echo -e "  ${YELLOW}Link closes automatically in 120 seconds.${RESET}"
+  echo -e "  ${DIM}Press Ctrl+C to close early.${RESET}"
   echo
 
-  # Background server — kills itself after 90s
-  (
-    cd "$(dirname "$zip_path")"
-    timeout 90 python3 -m http.server "$port" --bind 0.0.0.0 >/dev/null 2>&1 || true
-    ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
-  ) &
+  # countdown — kill server when done or on Ctrl+C
+  trap "kill $server_pid 2>/dev/null; ufw delete allow ${port}/tcp >/dev/null 2>&1 || true; echo; ok 'Download server closed.'; trap - INT TERM; return" INT TERM
 
-  # Live countdown
   local i
-  for ((i=90; i>0; i--)); do
-    printf "\r  ${DIM}⏱  Closing in %3d seconds...${RESET}   " "$i"
+  for ((i=120; i>0; i--)); do
+    # check if server process is still alive
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      break
+    fi
+    printf "\r  ${DIM}⏱  Closing in %3d seconds... (Ctrl+C to close now)${RESET}   " "$i"
     sleep 1
   done
+
+  # clean up
+  kill "$server_pid" 2>/dev/null || true
+  ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+  trap - INT TERM
+
   echo
   echo
-  ok "Link expired. ZIP saved permanently at:"
-  echo -e "  ${DIM}${zip_path}${RESET}"
+  ok "Download server closed."
+  echo -e "  ${DIM}ZIP saved permanently at: ${zip_path}${RESET}"
 }
 
 # ── Create single client ──────────────────────────────────────────────────────
@@ -356,7 +346,7 @@ create_one() {
   echo "${name}:${pub_ip}:$(date +%Y-%m-%d)" >> "$DB_FILE"
 
   ok "Client '${name}' created"
-  serve_zip "$zip_path"
+  serve_zip_with_link "$zip_path"
 }
 
 # ── Bulk create ───────────────────────────────────────────────────────────────
@@ -367,7 +357,7 @@ create_bulk() {
 
   read -rp "How many clients (1-200): " count
   if ! [[ "$count" =~ ^[0-9]+$ ]] || (( count < 1 || count > 200 )); then
-    fail "Count must be 1–200."; return
+    fail "Count must be 1-200."; return
   fi
 
   read -rp "Name prefix (blank = 'client'): " prefix
@@ -375,7 +365,7 @@ create_bulk() {
   prefix="$(echo "$prefix" | tr -dc 'a-zA-Z0-9_-' | head -c 20)"
   [[ -z "$prefix" ]] && prefix="client"
 
-  # Build unique name list
+  # build unique name list
   local names=() i=1
   while (( ${#names[@]} < count )); do
     local candidate="${prefix}_$(printf '%03d' $i)"
@@ -401,14 +391,17 @@ create_bulk() {
     echo -e " ${GREEN}✓${RESET}"
   done
 
-  # Pack all into one ZIP
+  echo
+  info "Packing ${count} .ovpn files into ZIP..."
+
+  # zip all ovpn files into single archive
   zip -j "$all_zip" "${ovpn_files[@]}" >/dev/null
 
   echo
-  ok "All ${count} clients packed → $(basename "$all_zip")"
+  ok "All ${count} clients packed into: $(basename "$all_zip")"
 
-  # Auto serve — no questions asked
-  serve_zip "$all_zip"
+  # auto serve with download link — no prompts
+  serve_zip_with_link "$all_zip"
 }
 
 # ── List clients ──────────────────────────────────────────────────────────────
@@ -453,7 +446,7 @@ download_existing() {
     zip -j "$zip_path" "$ovpn_path" >/dev/null
   fi
 
-  serve_zip "$zip_path"
+  serve_zip_with_link "$zip_path"
 }
 
 # ── Revoke client ─────────────────────────────────────────────────────────────
