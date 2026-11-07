@@ -13,7 +13,7 @@
 
 **OpenVPN Builder** sets up a full OpenVPN server with PKI on any Ubuntu/Debian VPS and lets you create, download, and revoke client `.ovpn` configs in bulk — all from a simple interactive menu.
 
-After bulk creation, a **temporary download link** is generated automatically. No extra steps — just copy the URL and download your ZIP.
+After creation, the ZIP is saved on the server and downloaded over SSH with `scp`. Client ZIPs contain private keys, so they are **never** served over plain HTTP or shared as a public link.
 
 Built with DNS leak prevention hardened for **Facebook / Meta traffic**.
 
@@ -23,14 +23,14 @@ Built with DNS leak prevention hardened for **Facebook / Meta traffic**.
 
 - One-command install — full server + PKI in one shot
 - Create single or **bulk clients (up to 200 at once)**
-- **Auto ZIP + temporary download link** after every creation
-- 90-second HTTP download server — opens and closes automatically
+- **Auto ZIP** after every creation, delivered over SSH (`scp`)
+- Optional localhost-only download server (127.0.0.1, reachable only via SSH tunnel) — no public HTTP server
 - Re-download any previous client ZIP at any time
 - Revoke clients (updates CRL, restarts server instantly)
 - **DNS leak prevention** — `block-outside-dns` + Cloudflare 1.1.1.1
 - **IPv6 leak prevention** — Facebook resolves to IPv6, this blocks that
 - All Facebook/Meta IP ranges routed through tunnel
-- AES-256-GCM + SHA256 + TLS 1.2 minimum
+- AES-256-GCM + SHA256 + TLS 1.2 minimum, EC P-256 certificates, tls-crypt, CRL enforced from install
 
 ---
 
@@ -65,8 +65,8 @@ sudo openvpnbuilder
 ║            Bulk Client Creator & Manager                    ║
 ╚══════════════════════════════════════════════════════════════╝
 
-1) Create Single Client        (auto download link)
-2) Create Bulk Clients         (auto ZIP + download link)
+1) Create Single Client        (secure copy)
+2) Create Bulk Clients         (auto ZIP + secure copy)
 3) List All Clients
 4) Re-Download a Client ZIP
 5) Revoke / Delete Client
@@ -76,7 +76,7 @@ sudo openvpnbuilder
 
 ---
 
-## Bulk Create + Auto Download
+## Bulk Create + Secure Download
 
 Select **option 2**, enter count and prefix — done.
 
@@ -91,20 +91,16 @@ Name prefix (blank = 'client'): fb
 
 [OK]   All 50 clients packed → bulk_fb_20250311_142300.zip
 
-  ╔════════════════════════════════════════════════════════════╗
-  ║              📦  YOUR DOWNLOAD LINK                       ║
-  ╚════════════════════════════════════════════════════════════╝
+  📦  CLIENT ZIP READY
+  File    : /etc/openvpnbuilder/zips/bulk_fb_20250311_142300.zip
 
-    ➜  http://YOUR_SERVER_IP:8342/bulk_fb_20250311_142300.zip
-
-  curl -O http://YOUR_SERVER_IP:8342/bulk_fb_20250311_142300.zip
-
-  Link is active for 90 seconds, then closes automatically.
-
-  ⏱  Closing in  87 seconds...
+  Download over SSH (recommended):
+  scp root@YOUR_SERVER_IP:/etc/openvpnbuilder/zips/bulk_fb_20250311_142300.zip .
 ```
 
-Open the link in your browser or run the curl command. The server closes automatically — no cleanup needed.
+The ZIP contains client private keys, so it is never served over plain HTTP.
+If you cannot use `scp`, the menu can start a localhost-only server
+(127.0.0.1) that you reach through an SSH tunnel (`ssh -L 8900:localhost:8900`).
 
 ---
 
