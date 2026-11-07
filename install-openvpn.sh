@@ -32,8 +32,8 @@ set_var EASYRSA_REQ_CITY       "San Francisco"
 set_var EASYRSA_REQ_ORG        "OpenVPN Builder"
 set_var EASYRSA_REQ_EMAIL      "admin@openvpnbuilder.local"
 set_var EASYRSA_REQ_OU         "VPN"
-set_var EASYRSA_KEY_SIZE        2048
-set_var EASYRSA_ALGO            rsa
+set_var EASYRSA_ALGO            ec
+set_var EASYRSA_CURVE           prime256v1
 set_var EASYRSA_CA_EXPIRE       3650
 set_var EASYRSA_CERT_EXPIRE     3650
 set_var EASYRSA_CERT_RENEW      30
@@ -44,8 +44,14 @@ VARS_EOF
   ./easyrsa --batch build-ca nopass
   ./easyrsa --batch gen-req server nopass
   ./easyrsa --batch sign-req server server
-  ./easyrsa --batch gen-dh
+  # No classic Diffie-Hellman: ECDHE with EC certificates needs no dh.pem.
+  # tls-crypt key (also authenticates the control channel; replaces tls-auth).
   openvpn --genkey secret "${EASYRSA_DIR}/pki/ta.key"
+  # Empty CRL so crl-verify is live from install time, not only after the
+  # first revocation (see revoke_client in the manager script).
+  ./easyrsa --batch gen-crl
+  mkdir -p /etc/openvpn/server
+  cp "${EASYRSA_DIR}/pki/crl.pem" /etc/openvpn/server/crl.pem
 
   cd - >/dev/null
   echo "[OK]  PKI ready"
@@ -65,8 +71,8 @@ dev tun
 ca   ${EASYRSA_DIR}/pki/ca.crt
 cert ${EASYRSA_DIR}/pki/issued/server.crt
 key  ${EASYRSA_DIR}/pki/private/server.key
-dh   ${EASYRSA_DIR}/pki/dh.pem
-tls-auth ${EASYRSA_DIR}/pki/ta.key 0
+tls-crypt ${EASYRSA_DIR}/pki/ta.key
+crl-verify /etc/openvpn/server/crl.pem
 
 server 10.8.0.0 255.255.255.0
 ifconfig-pool-persist /var/log/openvpn/ipp.txt
@@ -97,7 +103,7 @@ keepalive 10 120
 cipher AES-256-GCM
 auth SHA256
 tls-version-min 1.2
-tls-cipher TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384
+tls-cipher TLS-ECDHE-ECDSA-WITH-AES-256-GCM-SHA384
 ncp-ciphers AES-256-GCM:AES-256-CBC
 
 comp-lzo no
@@ -237,7 +243,7 @@ remote-cert-tls server
 cipher AES-256-GCM
 auth SHA256
 tls-version-min 1.2
-tls-cipher TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384
+tls-cipher TLS-ECDHE-ECDSA-WITH-AES-256-GCM-SHA384
 block-outside-dns
 dhcp-option DNS 1.1.1.1
 dhcp-option DNS 1.0.0.1
@@ -247,8 +253,6 @@ pull-filter ignore "route-ipv6"
 pull-filter ignore "ifconfig-ipv6"
 comp-lzo no
 verb 3
-key-direction 1
-
 <ca>
 ${ca}
 </ca>
@@ -258,68 +262,72 @@ ${cert}
 <key>
 ${key}
 </key>
-<tls-auth>
+<tls-crypt>
 ${ta}
-</tls-auth>
+</tls-crypt>
 OVPN
 
   echo "$ovpn_path"
 }
 
-# ── Print download box + run foreground countdown server ──────────────────────
-serve_zip_with_link() {
+# ── Deliver a client ZIP securely (Fixes #1) ─────────────────────────────────
+# The old public-HTTP download server ran `python3 -m http.server --bind
+# 0.0.0.0` and printed a public http:// link, serving a ZIP that contains a
+# client's PRIVATE KEY over unauthenticated plain HTTP to anyone who found
+# the port. That path is removed entirely. Delivery is now:
+#   1. scp/SFTP over SSH (recommended), or
+#   2. an opt-in, localhost-only (127.0.0.1) temporary server that the user
+#      reaches through an SSH tunnel — never bound to a public interface,
+#      never advertised as a public link.
+deliver_zip() {
   local zip_path="$1"
-  local pub_ip filename port server_pid
+  local pub_ip filename
   pub_ip="$(get_public_ip)"
   filename="$(basename "$zip_path")"
-  port="$(shuf -i 8100-8900 -n 1)"
 
-  # open firewall
-  ufw allow "${port}/tcp" >/dev/null 2>&1 || true
-
-  # start python server in background, capture PID
-  cd "$(dirname "$zip_path")"
-  python3 -m http.server "$port" --bind 0.0.0.0 >/dev/null 2>&1 &
-  server_pid=$!
-  cd - >/dev/null
-
-  # print the download box immediately after server starts
   echo
   echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════════════╗${RESET}"
-  echo -e "${GREEN}${BOLD}  ║                  📦  DOWNLOAD YOUR ZIP                      ║${RESET}"
+  echo -e "${GREEN}${BOLD}  ║                  📦  CLIENT ZIP READY                       ║${RESET}"
   echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════════════════════════╝${RESET}"
   echo
-  echo -e "  ${BOLD}File    :${RESET} ${filename}"
-  echo -e "  ${BOLD}Link    :${RESET} ${GREEN}${BOLD}http://${pub_ip}:${port}/${filename}${RESET}"
+  echo -e "  ${BOLD}File    :${RESET} ${zip_path}"
   echo
-  echo -e "  ${DIM}wget http://${pub_ip}:${port}/${filename}${RESET}"
-  echo -e "  ${DIM}curl -O http://${pub_ip}:${port}/${filename}${RESET}"
+  echo -e "  ${BOLD}Download over SSH (recommended):${RESET}"
+  echo -e "  ${DIM}scp root@${pub_ip}:${zip_path} .${RESET}"
   echo
-  echo -e "  ${YELLOW}Link closes automatically in 120 seconds.${RESET}"
-  echo -e "  ${DIM}Press Ctrl+C to close early.${RESET}"
+  echo -e "  ${DIM}This ZIP contains a client private key. It is never served${RESET}"
+  echo -e "  ${DIM}over plain HTTP. If you cannot use scp, you may start a${RESET}"
+  echo -e "  ${DIM}localhost-only server and reach it through an SSH tunnel:${RESET}"
+  echo -e "  ${DIM}  ssh -L 8900:localhost:8900 root@${pub_ip}${RESET}"
+  echo -e "  ${DIM}then open http://localhost:8900/${filename} on your machine.${RESET}"
   echo
 
-  # countdown — kill server when done or on Ctrl+C
-  trap "kill $server_pid 2>/dev/null; ufw delete allow ${port}/tcp >/dev/null 2>&1 || true; echo; ok 'Download server closed.'; trap - INT TERM; return" INT TERM
-
-  local i
-  for ((i=120; i>0; i--)); do
-    # check if server process is still alive
-    if ! kill -0 "$server_pid" 2>/dev/null; then
-      break
-    fi
-    printf "\r  ${DIM}⏱  Closing in %3d seconds... (Ctrl+C to close now)${RESET}   " "$i"
-    sleep 1
-  done
-
-  # clean up
-  kill "$server_pid" 2>/dev/null || true
-  ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
-  trap - INT TERM
-
-  echo
-  echo
-  ok "Download server closed."
+  read -rp "  Start a localhost-only (127.0.0.1) server for 120s? [y/N]: " ans
+  case "$ans" in
+    y|Y)
+      local port=8900 server_pid
+      cd "$(dirname "$zip_path")"
+      python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 &
+      server_pid=$!
+      cd - >/dev/null
+      echo
+      echo -e "  ${YELLOW}Localhost-only server running (127.0.0.1:${port}) — reachable only via SSH tunnel.${RESET}"
+      echo -e "  ${DIM}It closes automatically in 120 seconds. Press Ctrl+C to close early.${RESET}"
+      trap "kill $server_pid 2>/dev/null; echo; ok 'Local download server closed.'; trap - INT TERM; return" INT TERM
+      local i
+      for ((i=120; i>0; i--)); do
+        kill -0 "$server_pid" 2>/dev/null || break
+        printf "\r  ${DIM}⏱  Closing in %3d seconds... (Ctrl+C to close now)${RESET}   " "$i"
+        sleep 1
+      done
+      kill "$server_pid" 2>/dev/null || true
+      trap - INT TERM
+      echo
+      echo
+      ok "Local download server closed."
+      ;;
+    *) info "Skipped local server. ZIP kept at: ${zip_path}" ;;
+  esac
   echo -e "  ${DIM}ZIP saved permanently at: ${zip_path}${RESET}"
 }
 
@@ -346,7 +354,7 @@ create_one() {
   echo "${name}:${pub_ip}:$(date +%Y-%m-%d)" >> "$DB_FILE"
 
   ok "Client '${name}' created"
-  serve_zip_with_link "$zip_path"
+  deliver_zip "$zip_path"
 }
 
 # ── Bulk create ───────────────────────────────────────────────────────────────
@@ -401,7 +409,7 @@ create_bulk() {
   ok "All ${count} clients packed into: $(basename "$all_zip")"
 
   # auto serve with download link — no prompts
-  serve_zip_with_link "$all_zip"
+  deliver_zip "$all_zip"
 }
 
 # ── List clients ──────────────────────────────────────────────────────────────
@@ -446,7 +454,7 @@ download_existing() {
     zip -j "$zip_path" "$ovpn_path" >/dev/null
   fi
 
-  serve_zip_with_link "$zip_path"
+  deliver_zip "$zip_path"
 }
 
 # ── Revoke client ─────────────────────────────────────────────────────────────
@@ -515,8 +523,8 @@ show_summary() {
 menu() {
   title
   show_summary
-  echo -e "${BOLD}1)${RESET} Create Single Client       ${DIM}(auto download link)${RESET}"
-  echo -e "${BOLD}2)${RESET} Create Bulk Clients        ${DIM}(auto ZIP + download link)${RESET}"
+  echo -e "${BOLD}1)${RESET} Create Single Client       ${DIM}(secure copy)${RESET}"
+  echo -e "${BOLD}2)${RESET} Create Bulk Clients        ${DIM}(auto ZIP + secure copy)${RESET}"
   echo -e "${BOLD}3)${RESET} List All Clients"
   echo -e "${BOLD}4)${RESET} Re-Download a Client ZIP"
   echo -e "${BOLD}5)${RESET} Revoke / Delete Client"
